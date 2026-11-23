@@ -514,21 +514,18 @@ class KinematicEntity(Entity):
         # Overwrite parent link
         base_link._parent_idx = parent_link.idx
 
-        # Re-root the whole tree hanging from this entity's base link - scene-wide, because entities previously
-        # attached into this one already share its root and must follow it (chained attaches may run in any order);
-        # links of other trees declared in the same file keep their own root, as do the fixed flag and invweight. A
-        # link is fixed when its own joints and every joint above it are fixed, the base link's being gone, so the
-        # flag follows the parent link's down the tree, which the link order walks parents first.
-        for link in self._solver.links:
-            if link.root_idx == base_link.idx:
-                link._root_idx = parent_link.root_idx
-                link._is_fixed = self._solver.links[link.parent_idx].is_fixed and all(
-                    joint.type is gs.JOINT_TYPE.FIXED for joint in link.joints
-                )
+        # Re-root the whole tree hanging from this entity's base link (see '_get_rerooted_links'). A link is fixed when
+        # its own joints and every joint above it are fixed, the base link's being gone, so the flag follows the parent
+        # link's down the tree, which the link order walks parents first.
+        for link in self._get_rerooted_links():
+            link._root_idx = parent_link.root_idx
+            link._is_fixed = self._solver.links[link.parent_idx].is_fixed and all(
+                joint.type is gs.JOINT_TYPE.FIXED for joint in link.joints
+            )
 
-                # The attach moves this link into another kinematic tree, so its old tree's inverse weight no longer
-                # applies. The sentinel makes the solver recompute it during its refresh.
-                link.desc.invweight = np.full((2,), fill_value=-1.0, dtype=gs.np_float)
+            # The attach moves this link into another kinematic tree, so its old tree's inverse weight no longer
+            # applies. The sentinel makes the solver recompute it during its refresh.
+            link.desc.invweight = np.full((2,), fill_value=-1.0, dtype=gs.np_float)
 
         # The anchor of an aligned free root is the center of mass and principal axes of the body the build described,
         # and the attached links now extend that body. Its frame and qpos stay where they are, so the anchor stops
@@ -549,6 +546,28 @@ class KinematicEntity(Entity):
             entity_name=parent_entity.name, link_name=parent_link.name
         )
         self._is_attached = True
+
+    def _get_rerooted_links(self) -> list["KinematicLink"]:
+        """The links that attaching this entity moves into the kinematic tree of the parent link.
+
+        They are the tree hanging from the base link, scene-wide, because entities previously attached into this one
+        already share its root and must follow it (chained attaches may run in any order). A parser roots each body
+        welded to the world in a tree of its own, so a link welded to one of these links joins them along with its
+        own tree, while the other trees declared in the same file keep their root.
+        """
+        roots_idx = {self.links[0].idx}
+        links_idx = set()
+        links = []
+        for link in self._solver.links:
+            if link.root_idx not in roots_idx:
+                if link.parent_idx not in links_idx or any(
+                    joint.type is not gs.JOINT_TYPE.FIXED for joint in link.joints
+                ):
+                    continue
+                roots_idx.add(link.root_idx)
+            links_idx.add(link.idx)
+            links.append(link)
+        return links
 
     # ------------------------------------------------------------------------------------
     # ---------------------------------- control & io ------------------------------------
@@ -1732,10 +1751,8 @@ class RigidEntity(KinematicEntity):
         The slots of its collision vertices follow the fixed flags the attach leaves. The parameters are those of
         ``KinematicEntity.attach``.
         """
-        # The links the attach re-roots, scene-wide since entities attached beneath this one share its root, among
-        # which those fixed so far.
-        base_link = self.links[0]
-        links_fixed = [link for link in self._solver.links if link.root_idx == base_link.idx and link.is_fixed]
+        # The links the attach re-roots (see '_get_rerooted_links'), among which those fixed so far.
+        links_fixed = [link for link in self._get_rerooted_links() if link.is_fixed]
         super().attach(parent_entity, parent_link_name, pos, quat)
 
         # Inertial resolution skips the geometry estimate for a world-carried link (see '_describe_link'), so a link

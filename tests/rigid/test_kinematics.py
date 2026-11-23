@@ -1207,3 +1207,42 @@ def test_host_forward_kinematics(
         assert_allclose(geoms_quat, solver.get_geoms_quat(geoms_idx), tol=tol)
         assert_allclose(joints_xanchor[:, joints_mask], solver.get_joints_anchor_pos(joints_idx), tol=tol)
         assert_allclose(joints_xaxis[:, joints_mask], solver.get_joints_anchor_axis(joints_idx), tol=tol)
+
+
+@pytest.mark.required
+def test_attach_offset_welded_body(show_viewer, tol):
+    scene = gs.Scene(
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.0, -1.0, 1.0),
+            camera_lookat=(0.0, 0.0, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    carrier = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.05, 0.05, 0.05),
+            pos=(0.0, 0.0, 1.0),
+        ),
+    )
+    # A body welded to the world with an offset keeps the world link, which roots no tree of the body
+    tool = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=(
+                '<mujoco><worldbody><body pos="0.02 0 0"><geom pos="0 0 -0.15" size="0.05"/></body></worldbody>'
+                "</mujoco>"
+            ),
+            batch_fixed_verts=True,
+        ),
+    )
+    tool.attach(carrier, carrier.base_link.name)
+    scene.build()
+
+    # The geom follows the falling carrier, at the pose the body and the geom state in the carrier frame
+    carrier.set_quat(gu.xyz_to_quat(np.array([30.0, -20.0, 45.0]), degrees=True))
+    for _ in range(20):
+        scene.step()
+    (geom,) = tool.geoms
+    pos, quat = tensor_to_array(carrier.get_pos()), tensor_to_array(carrier.get_quat())
+    assert_allclose(geom.get_pos(), pos + gu.transform_by_quat(np.array([0.02, 0.0, -0.15]), quat), tol=tol)
+    assert not any(link.is_fixed for link in tool.links)
+    assert_equal([link.root_idx for link in tool.links], carrier.base_link.root_idx)
