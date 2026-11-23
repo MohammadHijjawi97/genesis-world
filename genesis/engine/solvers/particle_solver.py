@@ -12,6 +12,7 @@ from genesis.constants import STRUCTURE
 from genesis.engine.render_context import (
     ArrayRef,
     DynamicMesh,
+    DynamicTextures,
     Lines,
     ParticlesPhysics,
     Points,
@@ -124,7 +125,7 @@ class ParticleSolver(GravityMixin, TimeBasedMixin, Solver):
         super().build(n_envs)
 
     @gs.assert_built
-    @mutates(StateChange.GEOMETRY)
+    @mutates
     def set_particles_pos(self, poss, particles_idx=None, envs_idx=None) -> None:
         """
         Set the position of some particles, at rest.
@@ -152,7 +153,7 @@ class ParticleSolver(GravityMixin, TimeBasedMixin, Solver):
         return tensor[0] if self.n_envs == 0 else tensor
 
     @gs.assert_built
-    @mutates(StateChange.DYNAMICS)
+    @mutates
     def set_particles_vel(self, vels, particles_idx=None, envs_idx=None) -> None:
         """Set the velocity of some particles (see 'set_particles_pos')."""
         self._write_data(
@@ -167,7 +168,7 @@ class ParticleSolver(GravityMixin, TimeBasedMixin, Solver):
         return tensor[0] if self.n_envs == 0 else tensor
 
     @gs.assert_built
-    @mutates(StateChange.GEOMETRY, differentiable=False)
+    @mutates(differentiable=False)
     def set_particles_active(self, actives, particles_idx=None, envs_idx=None) -> None:
         """Set whether some particles take part in the simulation (see 'set_particles_pos')."""
         actives, particles_idx, envs_idx = self._sanitize_io_variables(
@@ -258,6 +259,9 @@ class ParticleScopedRenderContext(ScopedRenderContext[ParticleSolver]):
         self._entities_vvert_start = dict(
             zip(self._skinned_entities, (np.cumsum(entities_n_vverts) - entities_n_vverts).tolist())
         )
+        self.dynamic_textures = DynamicTextures(
+            [(entity.vmesh, entity, entity) for entity in self._skinned_entities], solver.n_envs
+        )
         self._tearable_entities = [
             entity for entity in self._skinned_entities if entity.material.structure == STRUCTURE.TEARABLE
         ]
@@ -347,6 +351,8 @@ class ParticleScopedRenderContext(ScopedRenderContext[ParticleSolver]):
                 physics=ParticlesPhysics(entity.material.rho, gravity, lower_bound, upper_bound),
                 roles=ShapeRoles.of(entity.idx, is_looks=is_pinned, is_debug=True),
                 _views=frozenset(("particle",)),
+                # The particles are drawn with their velocities
+                invalidated_by={solver: (StateChange.GEOMETRY, StateChange.DYNAMICS)},
             )
             self._entities_points.append(points)
             shapes.append(points)
@@ -370,7 +376,9 @@ class ParticleScopedRenderContext(ScopedRenderContext[ParticleSolver]):
                         seg_keys,
                         particles=points,
                         is_active=ArrayRef(self._skinned.entities_is_intact, i_t) if is_tearable else None,
+                        textures=self.dynamic_textures.get(entity.vmesh),
                         roles=ShapeRoles.of(entity.idx, is_looks=not is_pinned, is_debug=False),
+                        invalidated_by={solver: (StateChange.GEOMETRY,)},
                     )
                 )
                 i_t += is_tearable
@@ -497,6 +505,7 @@ class ParticleScopedRenderContext(ScopedRenderContext[ParticleSolver]):
         return tuple(meshes)
 
     def reset(self, envs_idx: torch.Tensor) -> None:
+        super().reset(envs_idx)
         if self._tearable_entities:
             kernel_reset_skinned_tear(envs_idx, self._skinned)
 

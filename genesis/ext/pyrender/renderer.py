@@ -3,11 +3,13 @@
 Author: Matthew Matl
 """
 
+import os
 import sys
+
+import numpy as np
 
 import PIL
 import pyglet
-import numpy as np
 from OpenGL.GL import *
 
 from .constants import (
@@ -27,8 +29,8 @@ from .jit_render import is_env_pass
 from .light import DirectionalLight, PointLight, SpotLight
 from .material import MetallicRoughnessMaterial, SpecularGlossinessMaterial
 from .shader_program import NormalShaderCache, ShaderProgramCache
-from .utils import format_color_vector
 from .texture import Texture
+from .utils import format_color_vector
 
 
 MARKER_XRAY_DIM_FACTOR = 0.3
@@ -147,6 +149,9 @@ class Renderer(object):
         # Update context with meshes and textures
         if is_first_pass:
             self.jit.update_context(scene, flags)
+            for texture in scene.updated_textures:
+                texture.upload_layers()
+            scene.updated_textures.clear()
             self.jit.update(scene)
             all_ready = self.jit.set_lighting(scene, is_grid)
 
@@ -844,8 +849,14 @@ class Renderer(object):
                 defines["HAS_OCCLUSION_TEX"] = 1
             if tf & TexFlags.EMISSIVE:
                 defines["HAS_EMISSIVE_TEX"] = 1
+                if primitive.material.emissiveTexture.tex_type == GL_TEXTURE_2D_ARRAY:
+                    defines["EMISSIVE_TEX_ARRAY"] = 1
             if tf & TexFlags.BASE_COLOR:
                 defines["HAS_BASE_COLOR_TEX"] = 1
+                if primitive.material.baseColorTexture.tex_type == GL_TEXTURE_2D_ARRAY:
+                    defines["BASE_COLOR_TEX_ARRAY"] = 1
+                    if primitive.material.baseColorTexture.data_format == GL_HALF_FLOAT:
+                        defines["BASE_COLOR_TEX_LINEAR"] = 1
             if tf & TexFlags.METALLIC_ROUGHNESS:
                 defines["HAS_METALLIC_ROUGHNESS_TEX"] = 1
             if tf & TexFlags.DIFFUSE:
@@ -999,8 +1010,10 @@ class Renderer(object):
             glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, self._main_cb)
             glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, self._main_db)
 
-            # Generate multisample buffer
-            num_samples = min(glGetIntegerv(GL_MAX_SAMPLES), 4)
+            # Generate multisample buffer. Each driver picks its own sample positions within a pixel, so pixels on
+            # edges differ between drivers. Tests use no multisampling, so that images match across platforms, as in the
+            # viewer window (see 'PYTEST_VERSION' in viewer.py).
+            num_samples = 0 if "PYTEST_VERSION" in os.environ else min(glGetIntegerv(GL_MAX_SAMPLES), 4)
             self._main_cb_ms, self._main_db_ms = glGenRenderbuffers(2)
             glBindRenderbuffer(GL_RENDERBUFFER, self._main_cb_ms)
             glRenderbufferStorageMultisample(

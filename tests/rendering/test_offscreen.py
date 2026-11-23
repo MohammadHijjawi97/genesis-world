@@ -17,7 +17,8 @@ from genesis.utils.video_encoder import VideoEncoder
 
 from ..conftest import IS_INTERACTIVE_VIEWER_AVAILABLE, SKIP_NO_VIEWER
 from ..utils.assertions import assert_allclose, assert_equal, assert_pixel_match, rgb_array_to_png_bytes
-from .conftest import RENDERER_TYPE
+from ..utils.misc import get_masks_mean_color, get_masks_shown_color
+from .conftest import RENDERER_TYPE, build_planes_scene
 
 
 @pytest.mark.required
@@ -90,13 +91,10 @@ def test_render_api(show_viewer, renderer_type, renderer):
             normal_arrs.append(tensor_to_array(normal_arr).astype(np.float32))
 
     try:
-        assert_allclose(np.diff(rgb_arrs, axis=0), 0.0, tol=gs.EPS)
-        assert_allclose(np.diff(seg_arrs, axis=0), 0.0, tol=gs.EPS)
-        assert_allclose(np.diff(normal_arrs, axis=0), 0.0, tol=gs.EPS)
-
-        # Depth is not matching at machine-precision because of MSAA being disabled for depth-only
-        msaa_mask = [0, 1, 2, 4, 5, 6] if renderer_type == RENDERER_TYPE.RASTERIZER else slice(None)
-        assert_allclose(np.diff(depth_arrs, axis=0)[msaa_mask], 0.0, tol=gs.EPS)
+        assert_equal(np.diff(rgb_arrs, axis=0), 0.0)
+        assert_equal(np.diff(seg_arrs, axis=0), 0.0)
+        assert_equal(np.diff(normal_arrs, axis=0), 0.0)
+        assert_equal(np.diff(depth_arrs, axis=0), 0.0)
     except AssertionError:
         if sys.platform == "darwin" and scene.visualizer.is_software:
             pytest.xfail("Flaky on MacOS with Apple Software Renderer.")
@@ -207,6 +205,299 @@ def test_emissive_composites(base_plus_emissive_glb, show_viewer, renderer):
 
 
 @pytest.mark.required
+def test_dynamic_texture(base_plus_emissive_glb, translucent_box_obj, show_viewer, png_snapshot):
+    RED = (1.0, 0.0, 0.0)
+    GREEN = (0.0, 1.0, 0.0)
+    BLUE = (0.0, 0.0, 1.0)
+    YELLOW = (1.0, 1.0, 0.0)
+    MAGENTA = (1.0, 0.0, 1.0)
+
+    # A screen switching between named variants, a label showing the texture of its asset or an image per environment,
+    # a lamp drawing an emission over its dark red base color, and a plane showing the texture of its asset.
+    scene, (screen, label, lamp, reference), camera = build_planes_scene(
+        (
+            gs.surfaces.Emission(
+                emissive_texture=gs.textures.DynamicTexture(
+                    resolution=(16, 16),
+                    variants={
+                        "blue": gs.textures.ColorTexture(
+                            color=BLUE,
+                        ),
+                        "red": gs.textures.ColorTexture(
+                            color=RED,
+                        ),
+                    },
+                ),
+            ),
+            gs.surfaces.Rough(
+                diffuse_texture=gs.textures.DynamicTexture(
+                    resolution=(8, 8),
+                    is_batched=True,
+                ),
+            ),
+            gs.surfaces.Default(
+                color=(0.3, 0.0, 0.0),
+                emissive_texture=gs.textures.DynamicTexture(
+                    resolution=(16, 16),
+                    variants=(
+                        gs.textures.ColorTexture(
+                            color=MAGENTA,
+                        ),
+                        gs.textures.ImageTexture(
+                            image_array=np.full((1, 1, 3), (0, 128, 0), dtype=np.uint8),
+                        ),
+                    ),
+                    is_batched=True,
+                ),
+            ),
+            gs.surfaces.Rough(),
+        ),
+        plane_size=(1.0, 1.0),
+        camera_pos=(0.0, 0.0, 4.0),
+        camera_res=(192, 64),
+        split_envs=True,
+        show_viewer=show_viewer,
+    )
+    # An asset giving a color and an emission, out of view, on a surface drawing its color in the emissive map
+    glow = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            file=base_plus_emissive_glb,
+            pos=(0.0, 20.0, 0.0),
+            fixed=True,
+        ),
+        surface=gs.surfaces.Emission(
+            emissive_texture=gs.textures.DynamicTexture(
+                resolution=(4, 4),
+            ),
+        ),
+    )
+    # An asset whose texture is translucent, out of view
+    translucent_box = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            file=translucent_box_obj,
+            pos=(0.0, 40.0, 0.0),
+            fixed=True,
+        ),
+        surface=gs.surfaces.Default(
+            diffuse_texture=gs.textures.DynamicTexture(
+                resolution=(4, 4),
+            ),
+        ),
+    )
+    # The camera sensor renders through a rasterizer of its own, which reads the dynamic textures apart from the camera
+    sensor = scene.add_sensor(
+        RasterizerCameraOptions(
+            res=(192, 64),
+            pos=(0.0, 0.0, 4.0),
+            lookat=(0.0, 0.0, 0.0),
+            fov=40.0,
+        )
+    )
+    scene.build(n_envs=2)
+
+    rgb, _, segmentation, _ = camera.render(rgb=True, segmentation=True)
+    masks = (
+        segmentation[:, None]
+        == np.array([entity.idx + 1 for entity in (screen, label, lamp, reference)])[:, None, None]
+    )
+
+    # The variants at build: the first color of the screen, the asset texture of the label, which matches the reference
+    # plane, and the magenta emission of the lamp.
+    assert_equal(get_masks_shown_color(rgb, masks)[:, [0, 2]], [BLUE, MAGENTA])
+    colors = get_masks_mean_color(rgb, masks)
+    assert_allclose(colors[:, 1], colors[:, 3], atol=10.0)
+    lamp_initial = colors[:, 2]
+    # A variant left to None shows the texture the asset gives, its opacity included
+    assert_equal(translucent_box.get_texture()[..., 0, 0, :], (255, 0, 0, 128))
+    # A variant left to None shows the color the asset gives, red, over its emission
+    glow_variant = glow.get_texture()
+    assert (glow_variant[..., 0] > 0.5).all() and (glow_variant[..., 1:3] < 0.1).all()
+
+    # A variant shown by name in one environment, one image per environment written into the batched variant, and a
+    # color shared by every one. The images as drawn are those of the shown variant, in the format of the map.
+    screen.set_texture(envs_idx=1, variant="red")
+    label.set_texture([GREEN, YELLOW])
+    lamp.set_texture(gs.textures.ColorTexture(color=GREEN))
+    assert_equal(screen.get_texture()[:, 4, 4], [(*BLUE, 1.0), (*RED, 1.0)])
+    assert_equal(label.get_texture(envs_idx=1)[:, 4, 4], (255, 255, 0, 255))
+    # The camera shows the changes at its next render, while the sensor renders them at the next step. The lamp keeps
+    # the red of its dark red base under any emission.
+    rgb_switched = camera.render(rgb=True)[0]
+    for frame in rgb_switched:
+        assert rgb_array_to_png_bytes(frame) == png_snapshot
+    scene.step()
+    for rgb in (rgb_switched, tensor_to_array(sensor.read().rgb)):
+        assert_equal(get_masks_shown_color(rgb, masks)[:, :2], [[BLUE, GREEN], [RED, YELLOW]])
+        colors = get_masks_mean_color(rgb, masks)
+        assert (colors[:, 2, 1] > 100.0).all() and (colors[:, 2, 2] < 5.0).all() and (colors[:, 2, 0] > 20.0).all()
+
+    # The emissive map holds linear values: an sRGB image variant shows as its decoded value written as pixels
+    lamp.set_texture(variant=1)
+    colors_variant = get_masks_mean_color(camera.render(rgb=True)[0], masks)
+    lamp.set_texture((0.0, ((128 / 255 + 0.055) / 1.055) ** 2.4, 0.0))
+    colors_drawn = get_masks_mean_color(camera.render(rgb=True)[0], masks)
+    assert_equal(colors_variant[:, 2], colors_drawn[:, 2])
+
+    # A reset of one environment shows the first variants there again, the asset texture of the plane, and a reset of
+    # the scene does so in every environment.
+    scene.reset(envs_idx=1)
+    rgb = camera.render(rgb=True)[0]
+    assert_equal(get_masks_shown_color(rgb, masks)[0, 1], GREEN)
+    colors = get_masks_mean_color(rgb, masks)
+    assert_allclose(colors[1, 1], colors[1, 3], atol=10.0)
+    scene.reset()
+    rgb = camera.render(rgb=True)[0]
+    assert_equal(get_masks_shown_color(rgb, masks)[:, 0], BLUE)
+    colors = get_masks_mean_color(rgb, masks)
+    assert_allclose(colors[:, 1], colors[:, 3], atol=10.0)
+    assert_equal(colors[:, 2], lamp_initial)
+
+    # Two writes into different environments between renders both show
+    label.set_texture(RED, envs_idx=0)
+    label.set_texture(BLUE, envs_idx=1)
+    assert_equal(get_masks_shown_color(camera.render(rgb=True)[0], masks)[:, 1], [RED, BLUE])
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_dynamic_texture_side_by_side_envs(n_envs, translucent_box_obj, show_viewer):
+    RED = (1.0, 0.0, 0.0)
+    GREEN = (0.0, 1.0, 0.0)
+    BLUE = (0.0, 0.0, 1.0)
+    YELLOW = (1.0, 1.0, 0.0)
+    MAGENTA = (1.0, 0.0, 1.0)
+
+    # Drawing every environment in one pass needs 'split_envs' off, while the images of each environment apart need it
+    # on, and the option holds for a whole scene.
+    scene, (screen, tile, lamp), camera = build_planes_scene(
+        (
+            gs.surfaces.Emission(
+                emissive_texture=gs.textures.DynamicTexture(
+                    resolution=(4, 4),
+                    variants=(
+                        gs.textures.ColorTexture(
+                            color=RED,
+                        ),
+                        gs.textures.ColorTexture(
+                            color=BLUE,
+                        ),
+                        gs.textures.ColorTexture(
+                            color=(0.5, 0.5, 0.5),
+                        ),
+                    ),
+                    is_batched=True,
+                ),
+            ),
+            gs.surfaces.Emission(
+                emissive_texture=gs.textures.DynamicTexture(
+                    resolution=(1, 1),
+                    is_batched=True,
+                ),
+            ),
+            gs.surfaces.Default(
+                color=(0.0, 0.0, 0.0),
+                emissive_texture=gs.textures.DynamicTexture(
+                    resolution=(1, 1),
+                    variants=(
+                        gs.textures.ColorTexture(
+                            color=(0.0, 0.0, 0.0),
+                        ),
+                    ),
+                    is_batched=True,
+                ),
+            ),
+        ),
+        plane_size=(0.4, 1.0),
+        camera_pos=(0.0, 0.75, 4.0),
+        camera_res=(64, 128),
+        split_envs=False,
+        show_viewer=show_viewer,
+    )
+    # The deformable entities show a dynamic texture too, out of the view of the first camera
+    deformable_surface = gs.surfaces.Emission(
+        emissive_texture=gs.textures.DynamicTexture(
+            resolution=(1, 1),
+            variants=(
+                gs.textures.ColorTexture(
+                    color=RED,
+                ),
+                gs.textures.ColorTexture(
+                    color=BLUE,
+                ),
+            ),
+        ),
+    )
+    block = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            file=translucent_box_obj,
+            pos=(5.0, 0.0, 0.3),
+        ),
+        material=gs.materials.FEM.Elastic(),
+        surface=deformable_surface,
+    )
+    cube = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            file=translucent_box_obj,
+            pos=(6.0, 0.0, 0.3),
+        ),
+        material=gs.materials.PBD.Elastic(),
+        surface=deformable_surface,
+    )
+    deformable_camera = scene.add_camera(
+        pos=(5.5, 0.75, 4.0),
+        lookat=(5.5, 0.75, 0.0),
+        res=(128, 128),
+        fov=40.0,
+    )
+    scene.build(n_envs=n_envs, env_spacing=(0.0, 1.5))
+    (vgeom,) = screen.vgeoms
+    n_envs_ = max(n_envs, 1)
+
+    # One image holds every environment, environment 0 in the bottom half and environment 1 in the top half
+    envs_rows_mask = (np.arange(128) >= 64) == (np.arange(n_envs_) == 0)[:, None]
+    _, _, segmentation, _ = camera.render(rgb=False, segmentation=True)
+    entities_seg_idx = np.array([entity.idx + 1 for entity in (screen, tile, lamp)])
+    masks = (segmentation == entities_seg_idx[:, None, None]) & envs_rows_mask[:, None, :, None]
+
+    # The batched variant shows its own image in each environment, as the color of the surface, which the emission
+    # stands for over a black base color. Each image is one pixel wide, so its rows are no multiple of 4 bytes.
+    tile.set_texture([GREEN, MAGENTA][:n_envs_])
+    lamp.set_texture([GREEN, BLUE][:n_envs_])
+    shown_rgb = get_masks_shown_color(camera.render(rgb=True)[0], masks)
+    assert_equal(shown_rgb[:, 1], [GREEN, MAGENTA][:n_envs_])
+    assert_equal(shown_rgb[:, 2], [GREEN, BLUE][:n_envs_])
+
+    # A variant per environment, then an image per environment, then a variant beside an image, then an image written
+    # in the last environment alone, which leaves the image of the others as it was. A color the surface draws as its
+    # base color is sRGB, as for a static color, held linear in the emissive map.
+    vgeom.set_texture(variant=2)
+    # The emissive map holds float16 values, rounded to a relative 2^-11
+    assert_allclose(vgeom.get_texture()[..., 0, 0, :3], ((0.5 + 0.055) / 1.055) ** 2.4, rtol=5e-4)
+    vgeom.set_texture(variant=[0, 1][:n_envs_])
+    assert_equal(vgeom.get_texture()[..., 0, 0, :], [(*RED, 1.0), (*BLUE, 1.0)][:n_envs_])
+    assert_equal(get_masks_shown_color(camera.render(rgb=True)[0], masks)[:, 0], [RED, BLUE][:n_envs_])
+    vgeom.set_texture([GREEN, YELLOW][:n_envs_])
+    assert_equal(get_masks_shown_color(camera.render(rgb=True)[0], masks)[:, 0], [GREEN, YELLOW][:n_envs_])
+    last_env_idx = n_envs_ - 1 if n_envs > 0 else None
+    vgeom.set_texture(envs_idx=last_env_idx, variant=0)
+    assert_equal(get_masks_shown_color(camera.render(rgb=True)[0], masks)[:, 0], [GREEN, RED][-n_envs_:])
+    vgeom.set_texture(BLUE, envs_idx=last_env_idx)
+    assert_equal(get_masks_shown_color(camera.render(rgb=True)[0], masks)[:, 0], [GREEN, BLUE][-n_envs_:])
+
+    # The deformable entities switch their variant per environment as a rigid one does, the visual geom of the FEM
+    # entity reading the variant of each environment as the entity set it.
+    block.set_texture(variant=[1, 0][:n_envs_])
+    cube.set_texture(variant=[1, 0][:n_envs_])
+    _, _, segmentation, _ = deformable_camera.render(rgb=False, segmentation=True)
+    deformables_seg_idx = np.array([block.idx + 1, cube.idx + 1])
+    deformable_masks = (segmentation == deformables_seg_idx[:, None, None, None]) & envs_rows_mask[:, :, None]
+    deformable_rgb = get_masks_shown_color(deformable_camera.render(rgb=True)[0], deformable_masks)
+    assert_equal(deformable_rgb, [BLUE, RED][:n_envs_])
+    assert_equal(block.vgeoms[0].get_texture()[..., 0, 0, :], [(*BLUE, 1.0), (*RED, 1.0)][:n_envs_])
+    assert_equal(block.get_texture()[..., 0, 0, :], [(*BLUE, 1.0), (*RED, 1.0)][:n_envs_])
+
+
+@pytest.mark.required
 @pytest.mark.parametrize(
     "renderer_type",
     [RENDERER_TYPE.RASTERIZER, RENDERER_TYPE.BATCHRENDER_RASTERIZER, RENDERER_TYPE.BATCHRENDER_RAYTRACER],
@@ -214,8 +505,9 @@ def test_emissive_composites(base_plus_emissive_glb, show_viewer, renderer):
 # Debug mode is forced for the batched scene, whose rendered snapshots are sensitive to fast-math
 @pytest.mark.parametrize("n_envs", [0, pytest.param(4, marks=pytest.mark.debug(True))])
 def test_render_api_advanced(tmp_path, n_envs, show_viewer, png_snapshot, renderer_type, renderer):
-    # Small discrepancies between different hardware due the different physics integration
-    png_snapshot.extension._std_err_threshold = 1.2
+    # Coincident triangles, which the meshes of the robot hold, tie in the depth test. Every rasterizer breaks the tie
+    # with its own rounding, so that the surfaces they cover come out speckled differently from one to the next.
+    png_snapshot.extension._std_err_threshold = 2.0
 
     CAM_RES = (256, 256)
     DIFF_TOL = 0.01
@@ -238,12 +530,6 @@ def test_render_api_advanced(tmp_path, n_envs, show_viewer, png_snapshot, render
         renderer=renderer,
         show_viewer=False,
         show_FPS=False,
-    )
-    scene.add_entity(
-        morph=gs.morphs.Plane(),
-        surface=gs.surfaces.Aluminium(
-            ior=10.0,
-        ),
     )
     robot = scene.add_entity(
         gs.morphs.URDF(
@@ -415,14 +701,9 @@ def test_render_api_advanced(tmp_path, n_envs, show_viewer, png_snapshot, render
         # Check that images are changing over time.
         # We expect sufficient difference between two consecutive frames.
         if frames_prev is not None:
-            try:
-                for img_data_prev, img_data in zip(frames_prev, frame_data):
-                    img_diff = np.abs(img_data_prev - img_data)
-                    assert np.sum(img_diff > np.finfo(np.float32).eps) > DIFF_TOL * img_data.size
-            except AssertionError:
-                if sys.platform == "darwin" and scene.visualizer.is_software:
-                    pytest.xfail("Flaky on MacOS with Apple Software Renderer. Successive captures are too close.")
-                raise
+            for img_data_prev, img_data in zip(frames_prev, frame_data):
+                img_diff = np.abs(img_data_prev - img_data)
+                assert np.sum(img_diff > np.finfo(np.float32).eps) > DIFF_TOL * img_data.size
         frames_prev = frame_data
 
         # Add current frame to monitor video
@@ -443,14 +724,9 @@ def test_render_api_advanced(tmp_path, n_envs, show_viewer, png_snapshot, render
         assert sum(1 for _ in container.decode(video=0)) == NUM_STEPS
 
     # Verify that the output is correct pixel-wise over multiple simulation steps
-    try:
-        for image_file in sorted(tmp_path.rglob("*.png")):
-            with open(image_file, "rb") as f:
-                assert f.read() == png_snapshot
-    except AssertionError:
-        if sys.platform == "darwin" and scene.visualizer.is_software:
-            pytest.xfail("Flaky on MacOS with Apple Software Renderer. Pixel-matching failure.")
-        raise
+    for image_file in sorted(tmp_path.rglob("*.png")):
+        with open(image_file, "rb") as f:
+            assert f.read() == png_snapshot
 
 
 @pytest.mark.slow  # ~250s
@@ -755,10 +1031,6 @@ def test_renders_heterogeneous_entities(n_envs, show_viewer, png_snapshot, rende
 
     scene.build(n_envs=n_envs)
 
-    if sys.platform == "darwin" and scene.visualizer.is_software:
-        # Small discrepancies between different hardware due the different physics integration
-        png_snapshot.extension._std_err_threshold = 3.0
-
     # The sphere variant fills the first environments and the duck the rest, placed on opposite sides so the duck
     # (yellow) occupies a known half of the image. The box (homogeneous) sits at the back of every environment.
     box_pos = np.array([[0.0, 1.4, 0.15], [0.4, 1.4, 0.15], [-0.4, 1.4, 0.15], [0.2, 1.4, 0.15]])
@@ -998,9 +1270,8 @@ def test_multi_submesh_fem_render(renderer_type, renderer, show_viewer, png_snap
     # holds it lower, so that each environment of a split render shows its own copy.
     fem.set_position([[0.0, 0.0, 0.2], [0.0, 0.0, 0.1]])
 
-    # The Apple Software Renderer that macOS CI falls back to differs from hardware on anti-aliased channels, and
-    # RayTracer is non-deterministic across GPUs; relax the pixel match for the color-like outputs in both cases.
-    if scene.visualizer.is_software or renderer_type == RENDERER_TYPE.RAYTRACER:
+    # RayTracer is non-deterministic across GPUs: relax the pixel match for the color-like outputs
+    if renderer_type == RENDERER_TYPE.RAYTRACER:
         png_snapshot.extension._std_err_threshold = 3.0
         png_snapshot.extension._blurred_kernel_size = 3
 
@@ -1444,10 +1715,9 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
     CAM_RES = (256, 256)
     RENDERED_ENVS = (1, 2)
 
-    # One threshold for every frame. Marker lines land on slightly different pixels from one rasterizer to the next,
-    # which the offscreen frames absorb through a blur; the viewer frame holds up without one.
+    # One threshold for every frame. The viewer frame needs it, because its marker lines land on slightly different
+    # pixels depending on the rasterizer.
     STD_ERR_THR = 1.5
-    BLUR_OFFSCREEN = 3
 
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
@@ -1621,7 +1891,6 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
 
     # The camera without markers shows the robots alone in each environment
     png_snapshot.extension._std_err_threshold = STD_ERR_THR
-    png_snapshot.extension._blurred_kernel_size = BLUR_OFFSCREEN
     for rgb_i in rgb:
         assert rgb_array_to_png_bytes(rgb_i) == png_snapshot
 
